@@ -56,8 +56,8 @@ The goal of this project is to build a local, privacy-focused tool that assists 
 
 This project is currently in the initial setup phase.
 
-*   [ ] Project scaffolding (Rust + Svelte).
-*   [ ] Basic UI layout with Tailwind.
+*   [X] Project scaffolding (Rust + Svelte).
+*   [X] Basic UI layout with Tailwind.
 *   [ ] Integration of News APIs.
 *   [ ] Integration of Prediction Market APIs.
 *   [ ] Implementation of Analysis Engine.
