@@ -58,7 +58,7 @@ This project is currently in the initial setup phase.
 
 *   [X] Project scaffolding (Rust + Svelte).
 *   [X] Basic UI layout with Tailwind.
-*   [ ] Integration of News APIs.
+*   [X] Integration of News APIs.
 *   [ ] Integration of Prediction Market APIs.
 *   [ ] Implementation of Analysis Engine.
 
