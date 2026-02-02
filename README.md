@@ -1,17 +1,17 @@
 # Kairos
 
-**AI-Driven Prediction Market Engine**
+**AI-Driven Prediction Market Research App**
 
-Kairos is a desktop application designed to identify investment opportunities in prediction markets (like Polymarket) by correlating real-time news events with active betting contracts.
+Kairos is a desktop application designed to surface potential mispricings in prediction markets (like Polymarket) by correlating news signals with active markets. It suggests allocations; it does not place trades.
 
 ## Project Overview
 
-The goal of this project is to build a local, privacy-focused tool that assists users in making data-backed decisions. The application will automate the following workflow:
+The goal is a local, privacy-focused tool that assists users in making data-backed decisions. The app automates the following workflow:
 
-1.  **Data Aggregation:** Fetch relevant articles from high-signal sources (e.g., HackerNews, Financial feeds) and active markets from prediction platforms.
-2.  **Semantic Analysis:** Use LLMs to determine the sentiment and implied probability of news events.
-3.  **Market Matching:** Connect vague news headlines to specific betting contracts using vector similarity.
-4.  **Strategy Recommendation:** Provide calculated investment suggestions based on user-defined budgets and timeframes.
+1.  **Data Aggregation:** Fetch articles from multiple sources (Hacker News, NewsAPI, and RSS feeds) plus active Polymarket markets.
+2.  **Semantic Analysis:** Use OpenAI embeddings to compare news vs. market text; optionally use LLM calls to estimate implied probabilities.
+3.  **Market Matching:** Connect news to relevant markets via vector similarity + keyword overlap.
+4.  **Strategy Recommendation:** Rank markets by estimated edge, liquidity, and risk; split suggested budget across low/medium/high risk.
 
 ## Tech Stack
 
@@ -19,7 +19,8 @@ The goal of this project is to build a local, privacy-focused tool that assists 
 *   **Tauri v2:** Application framework.
 *   **Tokio:** Asynchronous runtime for concurrent fetching.
 *   **Reqwest:** HTTP client for API interaction.
-*   **FastEmbed:** Local vector embedding generation.
+*   **Async-OpenAI:** Embeddings + LLM scoring.
+*   **Feed-rs:** RSS ingestion.
 
 **Frontend (Svelte)**
 *   **Svelte:** UI Framework.
@@ -33,6 +34,8 @@ The goal of this project is to build a local, privacy-focused tool that assists 
 *   Rust (latest stable)
 *   Node.js (LTS)
 *   pnpm (recommended)
+*   OpenAI API key (for embeddings + LLM scoring)
+*   NewsAPI key (optional, for additional news coverage)
 
 ### Installation
 
@@ -47,20 +50,33 @@ The goal of this project is to build a local, privacy-focused tool that assists 
     pnpm install
     ```
 
-3.  Run the application in development mode:
+3.  Configure environment variables (optional but recommended):
+    ```bash
+    # src-tauri/.env
+    OPENAI_API_KEY=your_key_here
+    NEWSAPI_KEY=your_key_here
+    ```
+
+4.  Run the application in development mode:
     ```bash
     pnpm tauri dev
     ```
 
-## Roadmap
+## Current Status
 
-This project is currently in the initial setup phase.
+This project is in active development. Core data ingestion and analysis are working, but tuning, ranking, and UI polish are ongoing.
 
-*   [X] Project scaffolding (Rust + Svelte).
-*   [X] Basic UI layout with Tailwind.
-*   [X] Integration of News APIs.
-*   [ ] Integration of Prediction Market APIs.
-*   [ ] Implementation of Analysis Engine.
+### Implemented
+*   News aggregation (Hacker News, NewsAPI, RSS feeds).
+*   Polymarket scanning (Gamma API, multiple pages/sorts).
+*   Embedding-based market matching + heuristic fallback.
+*   Risk-tiered recommendations + budget allocation.
+*   Progress updates streamed to the UI during analysis.
+
+### In Progress
+*   Better market quality filters (liquidity, resolution clarity).
+*   Improved topic clustering and correlation handling.
+*   More external signal integrations.
 
 ## License
 

@@ -6,3 +6,18 @@ export interface Article {
   descendants: number;
   item_type: string;
 }
+
+export interface Recommendation {
+  market_question: string;
+  market_slug: string;
+  source_article_title: string;
+  source_article_url: string;
+  identified_edge: number;
+  suggested_outcome: "YES" | "NO";
+  market_price: number;
+  estimated_prob: number;
+  reasoning: string;
+  risk_level: "low-risk" | "medium-risk" | "high-risk";
+  suggested_budget: number;
+  source?: string;
+}

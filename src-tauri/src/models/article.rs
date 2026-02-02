@@ -13,4 +13,10 @@ pub struct Article {
     pub descendants: i32,
     #[serde(rename = "type")]
     pub item_type: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
 }

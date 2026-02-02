@@ -22,7 +22,7 @@ impl serde::Serialize for ApiError {
 const API_BASE: &str = "https://hacker-news.firebaseio.com/v0";
 const TOP_STORIES_URL: &str = "/topstories.json";
 const ITEM_URL_BASE: &str = "/item/";
-const MAX_STORIES: usize = 50;
+const MAX_STORIES: usize = 100;
 const CONCURRENT_REQUESTS: usize = 10;
 
 // This helper function fetches the full details for a single article ID.
@@ -32,7 +32,6 @@ async fn fetch_article_details(client: &Client, id: u64) -> Result<Article, reqw
 }
 
 // This is the function that will be exposed to the Svelte frontend.
-#[tauri::command]
 pub async fn fetch_top_stories() -> Result<Vec<Article>, ApiError> {
     let client = Client::new();
 
@@ -56,15 +55,19 @@ pub async fn fetch_top_stories() -> Result<Vec<Article>, ApiError> {
         .await;
 
     // 4. Filter for importance and relevance
-    // The heuristic for "important" is score > 100 and more than 20 comments.
+    // Relaxed thresholds to widen coverage for market scanning.
     let all_articles_len = all_articles.len();
     let filtered_articles: Vec<Article> = all_articles
         .into_iter()
         .filter(|article| {
-            article.score > 100
-                && article.descendants > 20
+            article.score > 50
+                && article.descendants > 10
                 && article.item_type == "story"
                 && article.url.is_some()
+        })
+        .map(|mut article| {
+            article.source = Some("Hacker News".to_string());
+            article
         })
         .collect();
 
