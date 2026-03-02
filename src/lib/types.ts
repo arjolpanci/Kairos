@@ -10,6 +10,7 @@ export interface Article {
 export interface Recommendation {
   market_question: string;
   market_slug: string;
+  market_id: string;
   source_article_title: string;
   source_article_url: string;
   identified_edge: number;
@@ -20,4 +21,6 @@ export interface Recommendation {
   risk_level: "low-risk" | "medium-risk" | "high-risk";
   suggested_budget: number;
   source?: string;
+  confidence_score: number;
+  kelly_fraction: number;
 }

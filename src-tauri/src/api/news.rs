@@ -11,16 +11,67 @@ const GDELT_API_URL: &str = "https://api.gdeltproject.org/api/v2/doc/doc";
 const NEWSAPI_URL: &str = "https://newsapi.org/v2/everything";
 const DEFAULT_GDELT_MAX: usize = 100;
 const DEFAULT_NEWSAPI_MAX: usize = 100;
-const DEFAULT_NEWSAPI_PAGES: usize = 1;
+const DEFAULT_NEWSAPI_PAGES: usize = 5;
+const MAX_RSS_FEEDS_CONCURRENT: usize = 10;
 const RSS_FEEDS: &[&str] = &[
+    // Major News
     "https://feeds.bbci.co.uk/news/world/rss.xml",
     "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://feeds.bbci.co.uk/news/politics/rss.xml",
     "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml",
     "https://www.theguardian.com/world/rss",
+    "https://www.theguardian.com/business/rss",
+    "https://www.theguardian.com/politics/rss",
     "https://feeds.npr.org/1001/rss.xml",
+    "https://feeds.npr.org/1006/rss.xml",
     "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "https://www.cnbc.com/id/100727362/device/rss/rss.html",
     "https://www.aljazeera.com/xml/rss/all.xml",
+    // Financial/Business
+    "https://feeds.reuters.com/reuters/businessnews",
+    "https://feeds.reuters.com/reuters/topNews",
+    "https://feeds.reuters.com/reuters/politicsnews",
+    "https://feeds.bloomberg.com/markets/news.rss",
+    "https://feeds.bloomberg.com/economics/news.rss",
+    "https://feeds.bloomberg.com/politics/news.rss",
+    "https://feeds.marketwatch.com/marketwatch/topstories",
+    "https://feeds.marketwatch.com/marketwatch/politics",
+    "https://feeds.wsj.com/wsj/markets",
+    "https://feeds.wsj.com/wsj/business",
+    "https://feeds.wsj.com/wsj/politics",
+    "https://feeds.ft.com/ft/news",
+    "https://feeds.ft.com/ft/world",
+    "https://www.economist.com/latest/rss.xml",
+    "https://www.economist.com/finance-and-economics/rss.xml",
+    "https://www.economist.com/united-states/rss.xml",
+    "https://feeds.afr.com/rss/afr.xml",
+    // Tech/AI
+    "https://techcrunch.com/feed/",
+    "https://www.theverge.com/rss/index.xml",
+    "https://arstechnica.com/feed/",
+    "https://www.wired.com/feed/rss",
+    "https://www.technologyreview.com/feed/",
+    "https://www.ai-journal.com/rss.xml",
+    // Sports
+    "https://www.espn.com/espn/rss/news",
+    "https://www.si.com/rss/si_topstories.rss",
+    // Crypto
+    "https://cointelegraph.com/rss",
+    "https://coindesk.com/arc/outboundfeeds/rss/",
+    "https://decrypt.co/feed",
+    // Politics/Elections
+    "https://fivethirtyeight.com/politics/feed/",
+    "https://www.politico.com/rss/politics.xml",
+    "https://thehill.com/rss/syndicator/19109",
+    "https://www.washingtonpost.com/politics/rss_headlines.xml",
+    "https://apnews.com/rss/politics",
+    "https://apnews.com/rss/world-news",
+    "https://apnews.com/rss/business",
 ];
+const EXTERNAL_SIGNAL_TIMEOUT_SECS: u64 = 6;
 
 fn load_newsapi_key() -> Option<String> {
     if let Ok(key) = std::env::var("NEWSAPI_KEY") {
@@ -101,6 +152,102 @@ fn build_article(id_seed: &str, title: &str, url: Option<String>, source: &str, 
         published_at,
         summary,
     }
+}
+
+async fn fetch_external_signals(client: &Client) -> Result<Vec<Article>, String> {
+    let mut results = Vec::new();
+    let econ_url = std::env::var("ECON_CALENDAR_URL").ok();
+    let polls_url = std::env::var("POLL_FEED_URL").ok();
+
+    let urls = [econ_url, polls_url]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<String>>();
+
+    for url in urls {
+        let response = client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(EXTERNAL_SIGNAL_TIMEOUT_SECS))
+            .header("User-Agent", "Kairos/0.1 (contact: dev)")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            println!("External signal error: status={} url={} body={}", status, url, body);
+            continue;
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        if content_type.contains("xml") || url.ends_with(".xml") || url.ends_with(".rss") {
+            let feed = parser::parse(&bytes[..]).map_err(|e| format!("RSS parse error: {} url={}", e, url))?;
+            let source = feed
+                .title
+                .map(|t| t.content)
+                .unwrap_or_else(|| url.clone());
+            for entry in feed.entries {
+                let title = entry.title.map(|t| t.content).unwrap_or_default();
+                let link = entry.links.first().map(|l| l.href.clone());
+                if title.is_empty() || link.is_none() {
+                    continue;
+                }
+                let published_at = entry
+                    .published
+                    .or(entry.updated)
+                    .map(|dt| dt.to_rfc3339());
+                let summary = entry
+                    .summary
+                    .map(|s| s.content)
+                    .or_else(|| entry.content.and_then(|c| c.body));
+                let link_value = link.as_ref().unwrap().clone();
+                results.push(build_article(&link_value, &title, link, &source, published_at, summary));
+            }
+            continue;
+        }
+
+        let json: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("External signal JSON decode error: {} url={}", e, url))?;
+        let items = if let Some(arr) = json.as_array() {
+            arr.clone()
+        } else if let Some(arr) = json.get("items").and_then(|v| v.as_array()) {
+            arr.clone()
+        } else {
+            Vec::new()
+        };
+
+        for item in items {
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or_default();
+            let link = item.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+            if title.is_empty() || link.is_none() {
+                continue;
+            }
+            let source = item
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("External Signal");
+            let published_at = item
+                .get("published_at")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let summary = item
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let link_value = link.as_ref().unwrap().clone();
+            results.push(build_article(&link_value, title, link, source, published_at, summary));
+        }
+    }
+
+    Ok(results)
 }
 
 async fn fetch_gdelt_articles(client: &Client, seed_terms: &[String]) -> Result<Vec<Article>, String> {
@@ -316,15 +463,19 @@ async fn fetch_rss_feed(client: &Client, feed_url: &str) -> Result<Vec<Article>,
 async fn fetch_rss_articles(client: &Client) -> Result<Vec<Article>, String> {
     let stream = stream::iter(RSS_FEEDS.iter().copied())
         .map(|feed_url| fetch_rss_feed(client, feed_url))
-        .buffer_unordered(4);
+        .buffer_unordered(MAX_RSS_FEEDS_CONCURRENT);
 
     let mut results = Vec::new();
     let mut errors = 0;
+    let mut success = 0;
 
     stream
         .for_each(|res| {
             match res {
-                Ok(mut items) => results.append(&mut items),
+                Ok(mut items) => {
+                    results.append(&mut items);
+                    success += 1;
+                }
                 Err(err) => {
                     errors += 1;
                     println!("RSS error: {}", err);
@@ -334,9 +485,7 @@ async fn fetch_rss_articles(client: &Client) -> Result<Vec<Article>, String> {
         })
         .await;
 
-    if errors > 0 {
-        println!("RSS errors encountered: {}", errors);
-    }
+    println!("RSS feeds: {} successful, {} errors", success, errors);
 
     Ok(results)
 }
@@ -372,10 +521,11 @@ pub async fn fetch_all_articles(seed_from_hn: bool) -> Result<Vec<Article>, Stri
         Vec::new()
     };
 
-    let (gdelt_res, newsapi_res, rss_res) = tokio::join!(
+    let (gdelt_res, newsapi_res, rss_res, signals_res) = tokio::join!(
         fetch_gdelt_articles(&client, &seed_terms),
         fetch_newsapi_articles(&client, &seed_terms),
-        fetch_rss_articles(&client)
+        fetch_rss_articles(&client),
+        fetch_external_signals(&client)
     );
 
     let mut merged = hn_articles;
@@ -390,6 +540,10 @@ pub async fn fetch_all_articles(seed_from_hn: bool) -> Result<Vec<Article>, Stri
     match rss_res {
         Ok(mut rss) => merged.append(&mut rss),
         Err(err) => println!("RSS error: {}", err),
+    }
+    match signals_res {
+        Ok(mut signals) => merged.append(&mut signals),
+        Err(err) => println!("External signals error: {}", err),
     }
 
     let deduped = dedupe_articles(merged);

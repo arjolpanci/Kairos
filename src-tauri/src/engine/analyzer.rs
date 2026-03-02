@@ -1,5 +1,6 @@
 use crate::api::{news::fetch_all_articles, polymarket::fetch_active_markets};
 use crate::models::{article::Article, market::Market};
+use crate::storage::cache::Cache;
 use async_openai::{
     types::{
         CreateChatCompletionRequestArgs, ChatCompletionRequestMessage,
@@ -7,7 +8,7 @@ use async_openai::{
     },
     Client as OpenAIClient,
 };
-use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -15,6 +16,7 @@ use tauri::{AppHandle, Emitter};
 pub struct Recommendation {
     pub market_question: String,
     pub market_slug: String,
+    pub market_id: String,
     pub source_article_title: String,
     pub source_article_url: String,
     pub identified_edge: f64,
@@ -25,6 +27,8 @@ pub struct Recommendation {
     pub risk_level: String,
     pub suggested_budget: f64,
     pub source: Option<String>,
+    pub confidence_score: f64,
+    pub kelly_fraction: f64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -34,7 +38,6 @@ struct AnalysisStatus {
     progress: f32,
 }
 
-// Manual Cosine Similarity to avoid extra dependencies
 fn cosine_similarity(vec_a: &[f32], vec_b: &[f32]) -> f64 {
     let dot_product: f64 = vec_a.iter().zip(vec_b).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
     let norm_a: f64 = vec_a.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
@@ -156,36 +159,6 @@ fn market_end_date(market: &Market) -> Option<DateTime<Utc>> {
     dates.into_iter().min()
 }
 
-fn filter_markets_by_timeframe<'a>(markets: &'a [Market], timeframe_days: i64) -> Vec<&'a Market> {
-    let now = Utc::now();
-
-    if timeframe_days <= 7 {
-        let horizon = now + Duration::days(timeframe_days);
-        return markets
-            .iter()
-            .filter(|market| {
-                if let Some(end) = market_end_date(market) {
-                    end >= now && end <= horizon
-                } else {
-                    false
-                }
-            })
-            .collect();
-    }
-
-    let long_horizon = now + Duration::days(30);
-    markets
-        .iter()
-        .filter(|market| {
-            if let Some(end) = market_end_date(market) {
-                end >= long_horizon
-            } else {
-                false
-            }
-        })
-        .collect()
-}
-
 fn yes_price(market: &Market) -> Option<f64> {
     if market.outcomes.len() != market.outcome_prices.len() {
         return None;
@@ -264,6 +237,199 @@ fn liquidity_score(liquidity: f64, volume: f64) -> f64 {
     (liq * 0.6 + vol * 0.4).clamp(0.0, 1.0)
 }
 
+fn ambiguity_penalty(question: &str) -> f64 {
+    let q = question.to_lowercase();
+    let mut penalty: f64 = 0.0;
+    for term in [
+        "likely",
+        "probably",
+        "expected",
+        "may",
+        "might",
+        "could",
+        "as of",
+        "according to",
+        "estimate",
+        "rumor",
+        "reported",
+    ] {
+        if q.contains(term) {
+            penalty += 0.05;
+        }
+    }
+    penalty.min(0.3)
+}
+
+fn market_quality_score(market: &Market) -> f64 {
+    let liq = liquidity_score(market.liquidity.unwrap_or(0.0), market.volume.unwrap_or(0.0));
+    let ambiguity = ambiguity_penalty(&market.question);
+    (liq * (1.0 - ambiguity)).clamp(0.0, 1.0)
+}
+
+fn source_weight(article: &Article) -> f64 {
+    let source = article.source.as_deref().unwrap_or("").to_lowercase();
+    let mut weight = 1.0;
+    for (pattern, w) in [
+        ("reuters", 1.2),
+        ("ap", 1.1),
+        ("bloomberg", 1.2),
+        ("financial times", 1.2),
+        ("wsj", 1.1),
+        ("bbc", 1.1),
+        ("npr", 1.1),
+        ("cnbc", 1.05),
+        ("guardian", 1.05),
+    ] {
+        if source.contains(pattern) {
+            weight = w;
+            break;
+        }
+    }
+    weight
+}
+
+fn recency_weight(published_at: &Option<String>) -> f64 {
+    let Some(raw) = published_at else { return 0.7; };
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        let age_hours = (Utc::now() - dt.with_timezone(&Utc)).num_hours().max(0) as f64;
+        let half_life = 48.0;
+        return (0.5_f64).powf(age_hours / half_life).max(0.2);
+    }
+    0.7
+}
+
+// Helper functions for LLM response parsing
+fn extract_probability(content: &str) -> Option<f64> {
+    for line in content.lines() {
+        if line.to_lowercase().starts_with("probability:") {
+            let num_str = line.split(':').nth(1).unwrap_or("").trim();
+            return num_str.parse::<f64>().ok();
+        }
+    }
+    // Fallback: find any number between 0 and 1
+    let re = regex::Regex::new(r"\b(0\.\d+|1\.0|0|1)\b").ok()?;
+    re.find(content).and_then(|m| m.as_str().parse::<f64>().ok())
+}
+
+fn extract_confidence(content: &str) -> String {
+    for line in content.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("confidence:") {
+            if lower.contains("high") {
+                return "high".to_string();
+            } else if lower.contains("medium") {
+                return "medium".to_string();
+            } else if lower.contains("low") {
+                return "low".to_string();
+            }
+        }
+    }
+    "medium".to_string()
+}
+
+fn extract_edge_analysis(content: &str) -> String {
+    for line in content.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("edge_analysis:") || lower.starts_with("edge analysis:") {
+            return line.split(':').nth(1).unwrap_or("").trim().to_string();
+        }
+    }
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.ends_with(':') {
+            return trimmed.to_string();
+        }
+    }
+    "AI analysis completed".to_string()
+}
+
+// Kelly Criterion calculation
+fn calculate_kelly_fraction(prob: f64, market_price: f64) -> f64 {
+    if prob <= 0.0 || prob >= 1.0 || market_price <= 0.0 || market_price >= 1.0 {
+        return 0.0;
+    }
+
+    let edge = prob - market_price;
+    let variance = market_price * (1.0 - market_price);
+
+    let kelly = if variance > 0.0 {
+        (edge / variance) * 0.5
+    } else {
+        0.0
+    };
+
+    kelly.clamp(0.0, 0.25)
+}
+
+fn allocate_budget_with_kelly(
+    mut recommendations: Vec<Recommendation>,
+    budget: f64,
+    timeframe_days: i64,
+) -> Vec<Recommendation> {
+    recommendations.retain(|r| r.identified_edge.abs() > 0.02);
+
+    if recommendations.is_empty() {
+        return recommendations;
+    }
+
+    let (low_w, med_w, high_w) = budget_weights(timeframe_days);
+
+    let mut low_count = 0;
+    let mut med_count = 0;
+    let mut high_count = 0;
+    for rec in &recommendations {
+        match rec.risk_level.as_str() {
+            "low-risk" => low_count += 1,
+            "medium-risk" => med_count += 1,
+            _ => high_count += 1,
+        }
+    }
+
+    let low_budget = budget * low_w;
+    let med_budget = budget * med_w;
+    let high_budget = budget * high_w;
+
+    let mut low_kelly_sum = 0.0;
+    let mut med_kelly_sum = 0.0;
+    let mut high_kelly_sum = 0.0;
+
+    for rec in &recommendations {
+        match rec.risk_level.as_str() {
+            "low-risk" => low_kelly_sum += rec.kelly_fraction,
+            "medium-risk" => med_kelly_sum += rec.kelly_fraction,
+            _ => high_kelly_sum += rec.kelly_fraction,
+        }
+    }
+
+    for rec in &mut recommendations {
+        let tier_budget = match rec.risk_level.as_str() {
+            "low-risk" => low_budget,
+            "medium-risk" => med_budget,
+            _ => high_budget,
+        };
+
+        let tier_kelly_sum = match rec.risk_level.as_str() {
+            "low-risk" => low_kelly_sum,
+            "medium-risk" => med_kelly_sum,
+            _ => high_kelly_sum,
+        };
+
+        if tier_kelly_sum > 0.0 {
+            let normalized_kelly = rec.kelly_fraction / tier_kelly_sum;
+            rec.suggested_budget = (tier_budget * normalized_kelly).max(1.0).min(budget * 0.25);
+        } else {
+            let count = match rec.risk_level.as_str() {
+                "low-risk" => low_count.max(1),
+                "medium-risk" => med_count.max(1),
+                _ => high_count.max(1),
+            };
+            rec.suggested_budget = (tier_budget / count as f64).max(1.0).min(budget * 0.25);
+        }
+    }
+
+    recommendations
+}
+
 pub async fn run_full_analysis(
     app: AppHandle,
     budget: Option<f64>,
@@ -275,11 +441,45 @@ pub async fn run_full_analysis(
     let timeframe = timeframe.unwrap_or_else(|| "all".to_string());
     let timeframe_days = timeframe_to_days(&timeframe);
 
-    // 1. Fetch Data
     emit_status(&app, "fetch", "Fetching articles and markets...", 0.1);
+    let mut cache = Cache::new(&app).ok();
+    let cached_articles = cache
+        .as_ref()
+        .and_then(|c| c.get_recent_articles(48).ok())
+        .unwrap_or_default();
+    let cached_markets = cache
+        .as_ref()
+        .and_then(|c| c.get_recent_markets(24).ok())
+        .unwrap_or_default();
+
     let (articles_res, markets_res) = tokio::join!(fetch_all_articles(true), fetch_active_markets());
-    let articles = articles_res.map_err(|e| e.to_string())?;
-    let markets = markets_res.map_err(|e| e.to_string())?;
+    let mut articles = articles_res.map_err(|e| e.to_string())?;
+    let mut markets = markets_res.map_err(|e| e.to_string())?;
+
+    if !cached_articles.is_empty() {
+        articles.extend(cached_articles);
+    }
+    if !cached_markets.is_empty() {
+        markets.extend(cached_markets);
+    }
+
+    let mut seen_articles: std::collections::HashSet<String> = std::collections::HashSet::new();
+    articles.retain(|article| {
+        let key = article
+            .url
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| article.title.clone());
+        seen_articles.insert(key)
+    });
+
+    let mut seen_markets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    markets.retain(|market| seen_markets.insert(market.id.clone()));
+
+    if let Some(cache) = cache.as_mut() {
+        let _ = cache.upsert_articles(&articles);
+        let _ = cache.upsert_markets(&markets);
+    }
 
     if articles.is_empty() || markets.is_empty() {
         return Ok(vec![]);
@@ -288,16 +488,15 @@ pub async fn run_full_analysis(
     emit_status(
         &app,
         "filter",
-        "Using all active markets (no timeframe filter)...",
+        &format!("Processing {} articles and {} markets...", articles.len(), markets.len()),
         0.2,
     );
 
     let markets_by_timeframe: Vec<&Market> = markets.iter().collect();
 
-    // 2. Prepare text for embedding (Take top 80 to increase coverage)
     let article_texts: Vec<String> = articles
         .iter()
-        .take(80)
+        .take(150)
         .map(|a| {
             let mut text = a.title.clone();
             if let Some(summary) = &a.summary {
@@ -308,38 +507,54 @@ pub async fn run_full_analysis(
         })
         .collect();
 
-    let mut keywords: Vec<String> = crate::api::news::extract_keywords_from_titles(&article_texts, 18);
-    for kw in ["election", "inflation", "fed", "rates", "crypto", "earnings", "sports", "politics", "ai", "oil"] {
+    let mut keywords: Vec<String> = crate::api::news::extract_keywords_from_titles(&article_texts, 25);
+    for kw in ["election", "inflation", "fed", "rates", "crypto", "earnings", "sports", "politics", "ai", "oil", "trump", "biden", "war", "ukraine", "israel", "gaza", "trade", "tariff", "gdp", "recession", "stock", "market", "bitcoin", "ethereum", "nft"] {
         keywords.push(kw.to_string());
     }
     keywords.sort();
     keywords.dedup();
+
+    emit_status(
+        &app,
+        "filter",
+        &format!("Filtering {} markets by keywords...", markets_by_timeframe.len()),
+        0.25,
+    );
+
     let mut relevant_markets: Vec<&Market> = markets_by_timeframe
         .iter()
         .copied()
         .filter(|market| {
+            if market_quality_score(market) < 0.15 {
+                return false;
+            }
             let question = normalize_text(&market.question);
             keywords.iter().any(|kw| question.contains(kw))
         })
         .collect();
     if relevant_markets.is_empty() {
-        relevant_markets = markets_by_timeframe;
+        let mut sorted_markets: Vec<&Market> = markets_by_timeframe.iter().copied().collect();
+        sorted_markets.sort_by(|a, b| {
+            let score_a = market_quality_score(a);
+            let score_b = market_quality_score(b);
+            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        relevant_markets = sorted_markets.into_iter().take(500).collect();
     }
 
     emit_status(
         &app,
         "embedding",
-        "Generating semantic embeddings...",
+        &format!("Generating embeddings for {} articles and {} markets...", article_texts.len(), relevant_markets.len()),
         0.35,
     );
 
     let market_questions: Vec<String> = relevant_markets
         .iter()
-        .take(800)
+        .take(1000)
         .map(|m| market_text(m))
         .collect();
 
-    // 3. Generate Embeddings via OpenAI
     let article_emb_req = CreateEmbeddingRequestArgs::default()
         .model("text-embedding-3-small")
         .input(article_texts.clone())
@@ -356,7 +571,15 @@ pub async fn run_full_analysis(
 
     let market_embeddings = openai_client.embeddings().create(market_emb_req).await.map_err(|e| e.to_string())?;
 
-    // 4. Find Matches (Vector Search)
+    let mut market_embedding_map: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+    for (idx, market) in relevant_markets.iter().take(1000).enumerate() {
+        if let Some(emb) = market_embeddings.data.get(idx) {
+            market_embedding_map.insert(market.id.clone(), emb.embedding.clone());
+        }
+    }
+
+    emit_status(&app, "match", "Finding article-market matches...", 0.45);
+
     let mut relevant_pairs: Vec<(&Article, &Market, f64)> = Vec::new();
 
     for (i, art_emb) in article_embeddings.data.iter().enumerate() {
@@ -366,95 +589,139 @@ pub async fn run_full_analysis(
             if let Some(market) = relevant_markets.get(j) {
                 let article_text = article_texts.get(i).unwrap_or(&articles[i].title);
                 let overlap = keyword_overlap_score(article_text, &market.question);
-                let score = 0.75 * cosine + 0.25 * overlap;
-                if score > 0.25 {
+                let score = 0.7 * cosine + 0.3 * overlap;
+                if score > 0.22 {
                     scored.push((*market, score));
                 }
             }
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (market, score) in scored.into_iter().take(10) {
+        for (market, score) in scored.into_iter().take(15) {
             relevant_pairs.push((&articles[i], market, score));
         }
     }
 
-    // 5. Analyze Matches with LLM
+    emit_status(&app, "llm", "Running deep analysis on top matches...", 0.55);
+
     let mut llm_candidates: Vec<Recommendation> = Vec::new();
 
-    // Limit to top 8 analysis calls to be fast
     relevant_pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-    if relevant_pairs.is_empty() {
-        for article in articles.iter().take(10) {
-            for market in relevant_markets.iter().take(30) {
-                let score = keyword_overlap_score(&article.title, &market.question);
-                if score > 0.15 {
-                    relevant_pairs.push((article, *market, score));
-                }
-            }
+    let mut seen_markets_for_llm: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut llm_analysis_candidates: Vec<(&Article, &Market, f64)> = Vec::new();
+
+    for (article, market, score) in relevant_pairs.iter() {
+        if seen_markets_for_llm.insert(market.id.clone()) && *score > 0.3 {
+            llm_analysis_candidates.push((*article, *market, *score));
         }
-        relevant_pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        if llm_analysis_candidates.len() >= 25 {
+            break;
+        }
     }
 
-    emit_status(&app, "match", "Scoring candidate matches...", 0.55);
+    for (i, (article, market, match_score)) in llm_analysis_candidates.iter().enumerate() {
+        emit_status(&app, "llm", &format!("Analyzing match {}/{}...", i + 1, llm_analysis_candidates.len()), 0.55 + (i as f32 * 0.015));
 
-    relevant_pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut per_article_count: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-    for (article, market, _score) in relevant_pairs.iter().take(40) {
-        let count = per_article_count.entry(article.id).or_insert(0);
-        if *count >= 3 {
-            continue;
-        }
-        *count += 1;
         let market_price = yes_price(market).unwrap_or(0.5);
 
+        let article_context = if let Some(summary) = &article.summary {
+            format!("{}\n\nSummary: {}", article.title, summary)
+        } else {
+            article.title.clone()
+        };
+
         let prompt = format!(
-            "Article: '{}'\nMarket: '{}'\nBased on the article, estimate the probability that this market resolves YES. Return ONLY a number between 0.0 and 1.0.",
-            article.title, market.question
+            r#"You are an expert prediction market analyst. Analyze the relationship between this news article and prediction market.
+
+ARTICLE:
+{}
+
+MARKET QUESTION: "{}"
+MARKET OUTCOMES: {:?}
+CURRENT MARKET PRICE: {:.1}¢ (implies {:.0}% probability)
+
+Analyze and respond in this exact format:
+
+PROBABILITY: [number between 0.0 and 1.0 - your calibrated probability estimate]
+CONFIDENCE: [high/medium/low - how confident you are in this estimate]
+KEY_CLAIMS: [2-3 key claims from the article relevant to this market]
+EDGE_ANALYSIS: [1-2 sentences on why the market price might be wrong]
+RISKS: [1-2 sentences on what could make your estimate wrong]"#,
+            article_context,
+            market.question,
+            market.outcomes,
+            market_price * 100.0,
+            market_price * 100.0
         );
 
         let chat_req = CreateChatCompletionRequestArgs::default()
             .model("gpt-4o-mini")
             .messages([
-                ChatCompletionRequestMessage::System(async_openai::types::ChatCompletionRequestSystemMessage { content: "You are a quantitative analyst.".to_string(), name: None }),
-                ChatCompletionRequestMessage::User(async_openai::types::ChatCompletionRequestUserMessage { content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(prompt), name: None }),
+                ChatCompletionRequestMessage::System(async_openai::types::ChatCompletionRequestSystemMessage {
+                    content: "You are an expert prediction market analyst with deep expertise in extracting signal from news and calibrating probability estimates.".to_string(),
+                    name: None
+                }),
+                ChatCompletionRequestMessage::User(async_openai::types::ChatCompletionRequestUserMessage {
+                    content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(prompt),
+                    name: None
+                }),
             ])
+            .temperature(0.1)
+            .max_tokens(500_u32)
             .build().map_err(|e| e.to_string())?;
 
         if let Ok(response) = openai_client.chat().create(chat_req).await {
             if let Some(choice) = response.choices.first() {
                 let content = choice.message.content.clone().unwrap_or_default();
-                // Strip non-numeric chars just in case
-                let clean_content = content.replace(|c: char| !c.is_numeric() && c != '.', "");
 
-                if let Ok(prob) = clean_content.parse::<f64>() {
-                    let edge = prob - market_price;
-                    let risk = risk_level(market, edge, timeframe_days);
+                let prob = extract_probability(&content).unwrap_or(0.5);
+                let confidence = extract_confidence(&content);
+                let edge_analysis = extract_edge_analysis(&content);
 
-                    let market_slug = market_slug_for_url(market);
-                    llm_candidates.push(Recommendation {
-                        market_question: market.question.clone(),
-                        market_slug,
-                        source_article_title: article.title.clone(),
-                        source_article_url: article.url.clone().unwrap_or_default(),
-                        identified_edge: edge,
-                        suggested_outcome: if edge > 0.0 { "YES".to_string() } else { "NO".to_string() },
-                        market_price: market_price * 100.0,
-                        estimated_prob: prob,
-                        reasoning: format!("AI Model ({:.0}%) vs Market ({:.0}%)", prob * 100.0, market_price * 100.0),
-                        risk_level: risk,
-                        suggested_budget: 0.0,
-                        source: article.source.clone(),
-                    });
-                }
+                let edge = prob - market_price;
+                let risk = risk_level(market, edge, timeframe_days);
+                let quality = market_quality_score(market);
+                let signal_weight = source_weight(article) * recency_weight(&article.published_at);
+                let confidence_multiplier = match confidence.as_str() {
+                    "high" => 1.0,
+                    "medium" => 0.7,
+                    _ => 0.4,
+                };
+                let adjusted_edge = edge * quality * signal_weight * confidence_multiplier;
+
+                let market_slug = market_slug_for_url(market);
+
+                let kelly = calculate_kelly_fraction(prob, market_price);
+
+                llm_candidates.push(Recommendation {
+                    market_question: market.question.clone(),
+                    market_slug,
+                    market_id: market.id.clone(),
+                    source_article_title: article.title.clone(),
+                    source_article_url: article.url.clone().unwrap_or_default(),
+                    identified_edge: adjusted_edge,
+                    suggested_outcome: if edge > 0.0 { "YES".to_string() } else { "NO".to_string() },
+                    market_price: market_price * 100.0,
+                    estimated_prob: prob,
+                    reasoning: format!(
+                        "AI: {:.0}% vs Market: {:.0}% | {} | Quality: {:.2}",
+                        prob * 100.0,
+                        market_price * 100.0,
+                        edge_analysis,
+                        quality
+                    ),
+                    risk_level: risk,
+                    suggested_budget: 0.0,
+                    source: article.source.clone(),
+                    confidence_score: confidence_multiplier,
+                    kelly_fraction: kelly,
+                });
             }
         }
     }
 
     emit_status(&app, "budget", "Allocating budget by risk tier...", 0.85);
 
-    // 6. Build heuristic candidates so we always return recommendations.
     let mut best_by_market: std::collections::HashMap<String, (&Article, &Market, f64)> =
         std::collections::HashMap::new();
     for (article, market, score) in relevant_pairs.iter() {
@@ -477,11 +744,14 @@ pub async fn run_full_analysis(
         let risk = risk_level(market, edge, timeframe_days);
         let market_slug = market_slug_for_url(market);
         let liq_score = liquidity_score(market.liquidity.unwrap_or(0.0), market.volume.unwrap_or(0.0));
-        let rank_score = edge.abs() * (0.5 + liq_score);
+        let quality = market_quality_score(market);
+        let signal_weight = source_weight(article) * recency_weight(&article.published_at);
+        let rank_score = edge.abs() * (0.5 + liq_score) * quality * signal_weight;
 
         heuristic_candidates.push(Recommendation {
             market_question: market.question.clone(),
             market_slug,
+            market_id: market.id.clone(),
             source_article_title: article.title.clone(),
             source_article_url: article.url.clone().unwrap_or_default(),
             identified_edge: rank_score,
@@ -489,17 +759,20 @@ pub async fn run_full_analysis(
             market_price: market_price * 100.0,
             estimated_prob: model_prob,
             reasoning: format!(
-                "Heuristic signal (score {:.2}) vs Market ({:.0}%)",
+                "Heuristic signal (score {:.2}) vs Market ({:.0}%), quality {:.2}, signal {:.2}",
                 score,
-                market_price * 100.0
+                market_price * 100.0,
+                quality,
+                signal_weight
             ),
             risk_level: risk,
             suggested_budget: 0.0,
             source: article.source.clone(),
+            confidence_score: 0.5,
+            kelly_fraction: 0.0,
         });
     }
 
-    // Merge and de-duplicate (prefer LLM result when available).
     let mut recommendations: Vec<Recommendation> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -522,33 +795,55 @@ pub async fn run_full_analysis(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     for rec in heuristic_candidates {
-        if recommendations.len() >= 30 {
+        if recommendations.len() >= 50 {
             break;
         }
         if seen.insert(rec.market_slug.clone()) {
             recommendations.push(rec);
         }
     }
-    let (low_w, med_w, high_w) = budget_weights(timeframe_days);
-    let mut low_count = 0;
-    let mut med_count = 0;
-    let mut high_count = 0;
-    for rec in &recommendations {
-        match rec.risk_level.as_str() {
-            "low-risk" => low_count += 1,
-            "medium-risk" => med_count += 1,
-            _ => high_count += 1,
+
+    recommendations.sort_by(|a, b| {
+        b.identified_edge
+            .abs()
+            .partial_cmp(&a.identified_edge.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut clustered: Vec<Recommendation> = Vec::new();
+    let mut clusters: Vec<Vec<f32>> = Vec::new();
+    let mut cluster_counts: Vec<usize> = Vec::new();
+    let max_per_cluster = 2;
+
+    for rec in recommendations.into_iter() {
+        let emb = market_embedding_map.get(&rec.market_id);
+        if let Some(embedding) = emb {
+            let mut target: Option<usize> = None;
+            for (idx, rep) in clusters.iter().enumerate() {
+                if cosine_similarity(embedding, rep) > 0.86 {
+                    target = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = target {
+                if cluster_counts[idx] < max_per_cluster {
+                    cluster_counts[idx] += 1;
+                    clustered.push(rec);
+                }
+            } else {
+                clusters.push(embedding.clone());
+                cluster_counts.push(1);
+                clustered.push(rec);
+            }
+        } else {
+            clustered.push(rec);
+        }
+        if clustered.len() >= 50 {
+            break;
         }
     }
 
-    for rec in &mut recommendations {
-        let allocation = match rec.risk_level.as_str() {
-            "low-risk" => if low_count > 0 { budget * low_w / low_count as f64 } else { 0.0 },
-            "medium-risk" => if med_count > 0 { budget * med_w / med_count as f64 } else { 0.0 },
-            _ => if high_count > 0 { budget * high_w / high_count as f64 } else { 0.0 },
-        };
-        rec.suggested_budget = allocation;
-    }
+    let mut recommendations = clustered;
+    recommendations = allocate_budget_with_kelly(recommendations, budget, timeframe_days);
 
     emit_status(&app, "done", "Analysis complete.", 1.0);
     Ok(recommendations)

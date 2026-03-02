@@ -31,3 +31,5 @@ async-openai = "0.23.3"
 dotenvy = "0.15"
 
 serde-aux = "4.5"
+rusqlite = { version = "0.31", features = ["bundled"] }
+regex = "1.10"

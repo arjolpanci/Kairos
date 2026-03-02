@@ -3,15 +3,16 @@ use reqwest::Client;
 use std::collections::HashSet;
 
 const POLYMARKET_API_URL: &str = "https://gamma-api.polymarket.com/markets";
-const MARKET_PAGE_LIMIT: usize = 200;
-const MARKET_PAGES_PER_SORT: usize = 5;
+const MARKET_PAGE_LIMIT: usize = 500;
+const MARKET_PAGES_PER_SORT: usize = 4;
 
 pub async fn fetch_active_markets() -> Result<Vec<Market>, String> {
     let client = Client::new();
     let mut all_markets: Vec<Market> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    for sort in ["volume", "liquidity"] {
+    // Fetch from multiple sort orders to get diverse markets
+    for sort in ["volume", "liquidity", "newest"] {
         for page in 0..MARKET_PAGES_PER_SORT {
             let offset = page * MARKET_PAGE_LIMIT;
             let response_text = client
@@ -41,7 +42,14 @@ pub async fn fetch_active_markets() -> Result<Vec<Market>, String> {
                 if !seen.insert(market.id.clone()) {
                     continue;
                 }
+                // Filter out markets with insufficient data or liquidity
                 if market.outcome_prices.len() < 2 || market.question.trim().is_empty() {
+                    continue;
+                }
+                // Require minimum liquidity for quality markets
+                let liquidity = market.liquidity.unwrap_or(0.0);
+                let volume = market.volume.unwrap_or(0.0);
+                if liquidity < 5000.0 && volume < 10000.0 {
                     continue;
                 }
                 all_markets.push(market);
@@ -49,5 +57,6 @@ pub async fn fetch_active_markets() -> Result<Vec<Market>, String> {
         }
     }
 
+    println!("Fetched {} unique markets from Polymarket", all_markets.len());
     Ok(all_markets)
 }

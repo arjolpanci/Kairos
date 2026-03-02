@@ -22,7 +22,7 @@ impl serde::Serialize for ApiError {
 const API_BASE: &str = "https://hacker-news.firebaseio.com/v0";
 const TOP_STORIES_URL: &str = "/topstories.json";
 const ITEM_URL_BASE: &str = "/item/";
-const MAX_STORIES: usize = 100;
+const MAX_STORIES: usize = 200;
 const CONCURRENT_REQUESTS: usize = 10;
 
 // This helper function fetches the full details for a single article ID.
@@ -60,10 +60,9 @@ pub async fn fetch_top_stories() -> Result<Vec<Article>, ApiError> {
     let filtered_articles: Vec<Article> = all_articles
         .into_iter()
         .filter(|article| {
-            article.score > 50
-                && article.descendants > 10
+            article.score > 30
+                && article.descendants > 5
                 && article.item_type == "story"
-                && article.url.is_some()
         })
         .map(|mut article| {
             article.source = Some("Hacker News".to_string());
@@ -71,7 +70,7 @@ pub async fn fetch_top_stories() -> Result<Vec<Article>, ApiError> {
         })
         .collect();
 
-    println!("Fetched {} articles, filtered down to {}", all_articles_len, filtered_articles.len());
+    println!("Fetched {} HN articles, filtered down to {}", all_articles_len, filtered_articles.len());
 
     Ok(filtered_articles)
 }

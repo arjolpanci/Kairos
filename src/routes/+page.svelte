@@ -159,10 +159,13 @@
         </div>
       {:else if recommendations.length > 0}
         <div class="space-y-8">
-          <div class="flex flex-wrap items-center gap-3 text-xs text-neutral-500">
+          <div class="flex flex-wrap items-center gap-3 text-xs">
             <span class="px-2 py-1 rounded-full bg-neutral-800 text-neutral-300">Low risk: {lowRisk.length}</span>
             <span class="px-2 py-1 rounded-full bg-neutral-800 text-neutral-300">Medium risk: {medRisk.length}</span>
             <span class="px-2 py-1 rounded-full bg-neutral-800 text-neutral-300">High risk: {highRisk.length}</span>
+            <span class="px-2 py-1 rounded-full bg-emerald-900/30 text-emerald-400">
+              Total allocated: ${recommendations.reduce((sum, r) => sum + r.suggested_budget, 0).toFixed(2)}
+            </span>
           </div>
 
           {#if lowRisk.length > 0}
@@ -174,7 +177,7 @@
                     <div class="flex items-start justify-between gap-4">
                       <div>
                         <p class="font-semibold text-base leading-snug">{rec.market_question}</p>
-                        <button on:click={() => openExternal(`https://polymarket.com/event/${rec.market_slug}`)} class="text-xs text-neutral-500 hover:underline">
+                        <button type="button" on:click={() => openExternal(`https://polymarket.com/event/${rec.market_slug}`)} class="text-xs text-neutral-500 hover:text-emerald-400 hover:underline cursor-pointer">
                           View on Polymarket ↗
                         </button>
                       </div>
@@ -189,6 +192,14 @@
                     <div class="mt-3 flex items-center justify-between text-xs text-neutral-400">
                       <span>Stake ${rec.suggested_budget.toFixed(2)} on {rec.suggested_outcome}</span>
                       <span class="px-2 py-0.5 rounded-full bg-emerald-900/30 text-emerald-200">{rec.risk_level}</span>
+                    </div>
+                    <div class="mt-2 flex items-center gap-2 text-[11px]">
+                      <span class="text-neutral-500">AI confidence:</span>
+                      <span class={rec.confidence_score > 0.8 ? 'text-green-400' : rec.confidence_score > 0.5 ? 'text-amber-400' : 'text-neutral-400'}>
+                        {rec.confidence_score > 0.8 ? 'High' : rec.confidence_score > 0.5 ? 'Medium' : 'Low'}
+                      </span>
+                      <span class="text-neutral-600">|</span>
+                      <span class="text-neutral-500">Edge: {(rec.identified_edge * 100).toFixed(1)}%</span>
                     </div>
                     <div class="mt-3 pt-3 border-t border-neutral-800">
                       <p class="text-xs text-neutral-400">{rec.reasoning}</p>
@@ -214,7 +225,7 @@
                     <div class="flex items-start justify-between gap-4">
                       <div>
                         <p class="font-semibold text-base leading-snug">{rec.market_question}</p>
-                        <button on:click={() => openExternal(`https://polymarket.com/event/${rec.market_slug}`)} class="text-xs text-neutral-500 hover:underline">
+                        <button type="button" on:click={() => openExternal(`https://polymarket.com/event/${rec.market_slug}`)} class="text-xs text-neutral-500 hover:text-emerald-400 hover:underline cursor-pointer">
                           View on Polymarket ↗
                         </button>
                       </div>
@@ -229,6 +240,14 @@
                     <div class="mt-3 flex items-center justify-between text-xs text-neutral-400">
                       <span>Stake ${rec.suggested_budget.toFixed(2)} on {rec.suggested_outcome}</span>
                       <span class="px-2 py-0.5 rounded-full bg-amber-900/30 text-amber-200">{rec.risk_level}</span>
+                    </div>
+                    <div class="mt-2 flex items-center gap-2 text-[11px]">
+                      <span class="text-neutral-500">AI confidence:</span>
+                      <span class={rec.confidence_score > 0.8 ? 'text-green-400' : rec.confidence_score > 0.5 ? 'text-amber-400' : 'text-neutral-400'}>
+                        {rec.confidence_score > 0.8 ? 'High' : rec.confidence_score > 0.5 ? 'Medium' : 'Low'}
+                      </span>
+                      <span class="text-neutral-600">|</span>
+                      <span class="text-neutral-500">Edge: {(rec.identified_edge * 100).toFixed(1)}%</span>
                     </div>
                     <div class="mt-3 pt-3 border-t border-neutral-800">
                       <p class="text-xs text-neutral-400">{rec.reasoning}</p>
@@ -254,7 +273,7 @@
                     <div class="flex items-start justify-between gap-4">
                       <div>
                         <p class="font-semibold text-base leading-snug">{rec.market_question}</p>
-                        <button on:click={() => openExternal(`https://polymarket.com/event/${rec.market_slug}`)} class="text-xs text-neutral-500 hover:underline">
+                        <button type="button" on:click={() => openExternal(`https://polymarket.com/event/${rec.market_slug}`)} class="text-xs text-neutral-500 hover:text-emerald-400 hover:underline cursor-pointer">
                           View on Polymarket ↗
                         </button>
                       </div>
@@ -269,6 +288,14 @@
                     <div class="mt-3 flex items-center justify-between text-xs text-neutral-400">
                       <span>Stake ${rec.suggested_budget.toFixed(2)} on {rec.suggested_outcome}</span>
                       <span class="px-2 py-0.5 rounded-full bg-red-900/30 text-red-200">{rec.risk_level}</span>
+                    </div>
+                    <div class="mt-2 flex items-center gap-2 text-[11px]">
+                      <span class="text-neutral-500">AI confidence:</span>
+                      <span class={rec.confidence_score > 0.8 ? 'text-green-400' : rec.confidence_score > 0.5 ? 'text-amber-400' : 'text-neutral-400'}>
+                        {rec.confidence_score > 0.8 ? 'High' : rec.confidence_score > 0.5 ? 'Medium' : 'Low'}
+                      </span>
+                      <span class="text-neutral-600">|</span>
+                      <span class="text-neutral-500">Edge: {(rec.identified_edge * 100).toFixed(1)}%</span>
                     </div>
                     <div class="mt-3 pt-3 border-t border-neutral-800">
                       <p class="text-xs text-neutral-400">{rec.reasoning}</p>

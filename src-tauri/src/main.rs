@@ -4,6 +4,7 @@
 mod api;
 mod models;
 mod engine;
+mod storage;
 
 use engine::analyzer;
 use models::{article::Article, market::Market};
